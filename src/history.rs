@@ -1,6 +1,11 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque, vec_deque};
 
+use crate::config::HISTORY_STEPS_SECS;
 use crate::metrics::Snapshot;
+
+/// How far back data is kept, whatever the History setting: a graph stretched wider
+/// than normal shows further back (see `widgets::graph`), so the data must be there.
+pub const RETAIN_SECS: f64 = HISTORY_STEPS_SECS[HISTORY_STEPS_SECS.len() - 1] as f64;
 
 /// Time series of `[t, value]` with `t` in sampler seconds.
 #[derive(Default)]
@@ -9,6 +14,7 @@ pub struct Series {
 }
 
 pub struct History {
+    /// The History setting: how much time a normal-width graph shows.
     window: f64,
     now: f64,
     latest: Snapshot,
@@ -43,7 +49,7 @@ impl History {
         self.series.get(key)
     }
 
-    pub fn push(&mut self, mut snap: Snapshot) {
+    pub fn push(&mut self, snap: Snapshot) {
         self.now = snap.t;
         if let Some(cpu) = &snap.cpu {
             self.record("cpu", cpu.total as f64);
@@ -56,16 +62,30 @@ impl History {
                 self.record("swap", m.swap_used as f64 / m.swap_total as f64 * 100.0);
             }
         }
-        for d in &snap.disks {
+        for d in &snap.drives {
             self.record(&format!("disk:{}:r", d.name), d.read_bps);
             self.record(&format!("disk:{}:w", d.name), d.write_bps);
+        }
+        for g in &snap.gpus {
+            if let Some(v) = g.usage {
+                self.record(&format!("gpu-usage:{}", g.id), f64::from(v));
+            }
+            if let Some(v) = g.power_w {
+                self.record(&format!("gpu-power:{}", g.id), f64::from(v));
+            }
+            if let Some(v) = g.vram_used {
+                self.record(&format!("gpu-mem:{}:vram", g.id), v as f64);
+            }
+            if let Some(v) = g.system_used {
+                self.record(&format!("gpu-mem:{}:sys", g.id), v as f64);
+            }
+            for (label, t) in &g.temps {
+                self.record(&format!("gpu-temp:{}:{label}", g.id), f64::from(*t));
+            }
         }
         for n in &snap.net {
             self.record(&format!("net:{}:rx", n.name), n.rx_bps);
             self.record(&format!("net:{}:tx", n.name), n.tx_bps);
-        }
-        if snap.filesystems.is_none() {
-            snap.filesystems = self.latest.filesystems.take();
         }
         self.latest = snap;
         self.trim();
@@ -76,12 +96,16 @@ impl History {
         self.series.retain(|k, _| !k.starts_with(prefix));
     }
 
-    /// Points with x relative to now (−window..=0), min/max-decimated to about `buckets` columns.
-    pub fn plot_points(&self, key: &str, buckets: usize) -> Vec<[f64; 2]> {
-        match self.series.get(key) {
-            Some(s) => decimate(&s.pts, self.now, self.window, buckets.max(1)),
-            None => Vec::new(),
-        }
+    /// Points with x relative to now (−span..=0), min/max-decimated to about `buckets`
+    /// columns.
+    pub fn plot_points(&self, key: &str, span: f64, buckets: usize) -> Vec<[f64; 2]> {
+        let Some(s) = self.series.get(key) else {
+            return Vec::new();
+        };
+        // Start one point left of the span so the line reaches the plot's left edge.
+        let cutoff = self.now - span;
+        let first = s.pts.partition_point(|p| p[0] <= cutoff).saturating_sub(1);
+        decimate(s.pts.range(first..), self.now, span, buckets.max(1))
     }
 
     fn record(&mut self, key: &str, value: f64) {
@@ -100,7 +124,7 @@ impl History {
     }
 
     fn trim(&mut self) {
-        let cutoff = self.now - self.window;
+        let cutoff = self.now - self.window.max(RETAIN_SECS);
         self.series.retain(|_, s| {
             // Keep one point left of the window so the line reaches the plot's left edge.
             while s.pts.len() >= 2 && s.pts[1][0] <= cutoff {
@@ -112,10 +136,15 @@ impl History {
 }
 
 /// Min/max decimation: keeps each bucket's extremes so spikes survive downsampling.
-fn decimate(pts: &VecDeque<[f64; 2]>, now: f64, window: f64, buckets: usize) -> Vec<[f64; 2]> {
+fn decimate(
+    pts: vec_deque::Iter<'_, [f64; 2]>,
+    now: f64,
+    window: f64,
+    buckets: usize,
+) -> Vec<[f64; 2]> {
     let rel = |p: &[f64; 2]| [p[0] - now, p[1]];
     if pts.len() <= buckets * 2 {
-        return pts.iter().map(rel).collect();
+        return pts.map(rel).collect();
     }
     let width = window / buckets as f64;
     let mut out = Vec::with_capacity(buckets * 2 + 2);
@@ -165,22 +194,37 @@ mod tests {
             t,
             cpu: Some(CpuSample {
                 total,
-                per_core: vec![],
+                ..Default::default()
             }),
             ..Default::default()
         }
     }
 
     #[test]
-    fn trims_to_window_keeping_one_leading_point() {
+    fn plots_the_requested_span_keeping_one_leading_point() {
         let mut h = History::new(10.0);
         for i in 0..=30 {
             h.push(cpu_snap(i as f64, i as f32));
         }
-        let pts = h.plot_points("cpu", 1000);
+        let pts = h.plot_points("cpu", 10.0, 1000);
         assert_eq!(pts.first().unwrap()[0], -10.0);
         assert_eq!(pts.last().unwrap(), &[0.0, 30.0]);
         assert_eq!(pts.len(), 11);
+        // A wider graph reaches further back into what is kept.
+        let wide = h.plot_points("cpu", 20.5, 1000);
+        assert_eq!(wide.first().unwrap()[0], -21.0);
+        assert_eq!(wide.len(), 22);
+    }
+
+    #[test]
+    fn keeps_data_beyond_the_setting_up_to_the_retention_limit() {
+        let mut h = History::new(30.0);
+        let end = RETAIN_SECS + 100.0;
+        for i in 0..=(end as usize) {
+            h.push(cpu_snap(i as f64, 1.0));
+        }
+        let all = h.plot_points("cpu", 1e9, 100_000);
+        assert_eq!(all.first().unwrap()[0], -RETAIN_SECS);
     }
 
     #[test]
@@ -196,20 +240,8 @@ mod tests {
             ..Default::default()
         });
         assert!(h.series("net:usb0:rx").is_some());
-        h.push(cpu_snap(10.0, 1.0));
+        h.push(cpu_snap(RETAIN_SECS + 10.0, 1.0));
         assert!(h.series("net:usb0:rx").is_none());
-    }
-
-    #[test]
-    fn filesystems_persist_between_slow_ticks() {
-        let mut h = History::new(60.0);
-        h.push(Snapshot {
-            t: 0.0,
-            filesystems: Some(vec![]),
-            ..Default::default()
-        });
-        h.push(cpu_snap(1.0, 5.0));
-        assert!(h.latest().filesystems.is_some());
     }
 
     #[test]
@@ -227,7 +259,7 @@ mod tests {
             })
             .collect();
         let now = 1799.9;
-        let out = decimate(&pts, now, 1800.0, 400);
+        let out = decimate(pts.iter(), now, 1800.0, 400);
         assert!(out.len() <= 2 * 401);
         assert!(out.iter().any(|p| p[1] == 100.0));
         assert!(out.iter().any(|p| p[1] == -5.0));

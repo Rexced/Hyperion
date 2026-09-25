@@ -81,6 +81,7 @@ impl CpuCollector {
                 // CPU hotplug changed the core count; skip one delta.
                 vec![0.0; cores.len()]
             },
+            ..Default::default()
         };
         self.prev_total = total;
         self.prev_cores = cores;

@@ -1,19 +1,17 @@
 //! Minimal Hyprland IPC client. Wayland doesn't let an app position its own windows,
 //! but Hyprland's control socket lets us ask the compositor to float and move them.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-/// How close (logical px) a dropped window must be to an edge before it snaps to it.
-pub const SNAP_DISTANCE: f32 = 24.0;
-/// Space kept between a snapped window and the edge or neighbour it snapped to.
-pub const SNAP_GAP: f32 = 8.0;
+use crate::placement::Rect;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Client {
@@ -25,6 +23,9 @@ pub struct Client {
     pub size: [i32; 2],
     #[serde(default)]
     pub floating: bool,
+    /// Id of the monitor whose workspace the window is on.
+    #[serde(default)]
+    pub monitor: i64,
 }
 
 impl Client {
@@ -40,6 +41,10 @@ impl Client {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Monitor {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub name: String,
     pub x: i32,
     pub y: i32,
     pub width: i32,
@@ -48,9 +53,26 @@ pub struct Monitor {
     /// Space taken by bars: `[left, top, right, bottom]`.
     #[serde(default)]
     pub reserved: [i32; 4],
+    /// New windows open on the focused monitor.
+    #[serde(default)]
+    pub focused: bool,
+    /// In Hz.
+    #[serde(default, rename = "refreshRate")]
+    pub refresh_rate: f32,
 }
 
 impl Monitor {
+    /// The whole monitor, in global logical coordinates.
+    pub fn bounds(&self) -> Rect {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        Rect {
+            x: self.x as f32,
+            y: self.y as f32,
+            w: self.width as f32 / scale,
+            h: self.height as f32 / scale,
+        }
+    }
+
     /// The part of the monitor not covered by bars, in global logical coordinates.
     pub fn usable(&self) -> Rect {
         let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
@@ -64,22 +86,10 @@ impl Monitor {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Rect {
-    pub x: f32,
-    pub y: f32,
-    pub w: f32,
-    pub h: f32,
-}
-
-impl Rect {
-    pub fn contains(&self, p: [f32; 2]) -> bool {
-        p[0] >= self.x && p[0] < self.x + self.w && p[1] >= self.y && p[1] < self.y + self.h
-    }
-
-    fn center(&self) -> [f32; 2] {
-        [self.x + self.w / 2.0, self.y + self.h / 2.0]
-    }
+#[derive(Deserialize)]
+struct Workspace {
+    id: i64,
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -96,27 +106,50 @@ enum Dialect {
     Legacy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Action {
     Float,
     Resize([i32; 2]),
     Move([i32; 2]),
+    /// Send to a workspace; `follow` also switches the view to it and focuses.
+    ToWorkspace {
+        workspace: String,
+        follow: bool,
+    },
+    /// Moves the window onto a monitor (its active workspace). Hyprland only draws a
+    /// window on its own workspace's monitor, so a window positioned over another
+    /// monitor must be moved there too or it is invisible.
+    ToMonitor(String),
+    Focus,
 }
+
+/// Private special workspace the main window hides on. Special workspaces are only
+/// shown when explicitly toggled, and nothing else uses this name.
+const HIDDEN_WORKSPACE: &str = "special:hyperion";
 
 fn lua_command(address: &str, actions: &[Action]) -> String {
     let window = format!("address:{address}");
     let calls: Vec<String> = actions
         .iter()
-        .map(|a| match *a {
+        .map(|a| match a {
             Action::Float => format!(
                 "hl.dispatch(hl.dsp.window.float({{ window = \"{window}\", action = \"set\" }}))"
             ),
-            Action::Resize([w, h]) => format!(
+            &Action::Resize([w, h]) => format!(
                 "hl.dispatch(hl.dsp.window.resize({{ window = \"{window}\", x = {w}, y = {h} }}))"
             ),
-            Action::Move([x, y]) => format!(
+            &Action::Move([x, y]) => format!(
                 "hl.dispatch(hl.dsp.window.move({{ window = \"{window}\", x = {x}, y = {y} }}))"
             ),
+            Action::ToWorkspace { workspace, follow } => format!(
+                "hl.dispatch(hl.dsp.window.move({{ window = \"{window}\", workspace = {}, follow = {follow} }}))",
+                lua_string(workspace)
+            ),
+            Action::ToMonitor(monitor) => format!(
+                "hl.dispatch(hl.dsp.window.move({{ window = \"{window}\", monitor = {}, follow = false }}))",
+                lua_string(monitor)
+            ),
+            Action::Focus => format!("hl.dispatch(hl.dsp.focus({{ window = \"{window}\" }}))"),
         })
         .collect();
     format!("eval {}", calls.join(" "))
@@ -125,14 +158,30 @@ fn lua_command(address: &str, actions: &[Action]) -> String {
 fn legacy_command(address: &str, actions: &[Action]) -> String {
     let calls: Vec<String> = actions
         .iter()
-        .map(|a| match *a {
+        .map(|a| match a {
             Action::Float => format!("dispatch setfloating address:{address}"),
-            Action::Resize([w, h]) => {
+            &Action::Resize([w, h]) => {
                 format!("dispatch resizewindowpixel exact {w} {h},address:{address}")
             }
-            Action::Move([x, y]) => {
+            &Action::Move([x, y]) => {
                 format!("dispatch movewindowpixel exact {x} {y},address:{address}")
             }
+            Action::ToWorkspace {
+                workspace,
+                follow: true,
+            } => {
+                format!("dispatch movetoworkspace {workspace},address:{address}")
+            }
+            Action::ToWorkspace {
+                workspace,
+                follow: false,
+            } => {
+                format!("dispatch movetoworkspacesilent {workspace},address:{address}")
+            }
+            Action::ToMonitor(monitor) => {
+                format!("dispatch movewindow mon:{monitor},address:{address}")
+            }
+            Action::Focus => format!("dispatch focuswindow address:{address}"),
         })
         .collect();
     format!("[[BATCH]]{}", calls.join(";"))
@@ -155,15 +204,23 @@ fn lua_string(text: &str) -> String {
 
 /// A named rule (re-registering the same name just updates it) so the window maps
 /// already floating at its final size and position.
-fn lua_tile_rule(class: &str, title: &str, pos: Option<[i32; 2]>, size: [i32; 2]) -> String {
+/// `pos` is relative to `monitor`, as rule positions are.
+fn lua_tile_rule(
+    class: &str,
+    title: &str,
+    placement: Option<(&str, [i32; 2])>,
+    size: [i32; 2],
+) -> String {
     let name = lua_string(&format!("{class}: {title}"));
     let class = lua_string(&format!("^({})$", regex_escape(class)));
     let title = lua_string(&format!("^({})$", regex_escape(title)));
     let [w, h] = size;
-    let placement = pos.map_or(String::new(), |[x, y]| format!(", move = {{ {x}, {y} }}"));
+    let placement = placement.map_or(String::new(), |(monitor, [x, y])| {
+        format!(", monitor = {}, move = {{ {x}, {y} }}", lua_string(monitor))
+    });
     format!(
         "eval hl.window_rule({{ name = {name}, match = {{ class = {class}, title = {title} }}, \
-         float = true, size = {{ {w}, {h} }}{placement} }})"
+         float = true, no_anim = true, size = {{ {w}, {h} }}{placement} }})"
     )
 }
 
@@ -172,6 +229,7 @@ fn legacy_tile_rule(class: &str, title: &str, size: [i32; 2]) -> String {
     let title = regex_escape(title);
     format!(
         "[[BATCH]]keyword windowrulev2 float,class:^({class})$;\
+         keyword windowrulev2 noanim,class:^({class})$;\
          keyword windowrulev2 size {w} {h},title:^({title})$"
     )
 }
@@ -185,6 +243,12 @@ fn all_ok(reply: &str) -> bool {
 pub struct Hypr {
     socket: PathBuf,
     dialect: Cell<Option<Dialect>>,
+    /// Monitor layout, refreshed every few seconds (it rarely changes, and moves
+    /// happen every frame during a drag).
+    monitors: RefCell<Option<(Instant, Vec<Monitor>)>>,
+    /// Monitor each of our windows was last put on, so crossing monitors mid-drag
+    /// sends the extra "move to monitor" step only when needed.
+    window_monitor: RefCell<HashMap<String, i64>>,
 }
 
 impl Hypr {
@@ -203,6 +267,8 @@ impl Hypr {
             .map(|socket| Self {
                 socket,
                 dialect: Cell::new(None),
+                monitors: RefCell::new(None),
+                window_monitor: RefCell::new(HashMap::new()),
             })
     }
 
@@ -230,7 +296,45 @@ impl Hypr {
     }
 
     pub fn monitors(&self) -> Vec<Monitor> {
-        self.query("monitors").unwrap_or_default()
+        let fresh = self.query::<Vec<Monitor>>("monitors").unwrap_or_default();
+        *self.monitors.borrow_mut() = Some((Instant::now(), fresh.clone()));
+        fresh
+    }
+
+    fn cached_monitors(&self) -> Vec<Monitor> {
+        if let Some((at, list)) = &*self.monitors.borrow()
+            && at.elapsed() < Duration::from_secs(3)
+        {
+            return list.clone();
+        }
+        self.monitors()
+    }
+
+    /// The monitor under the middle of a window at `pos` with `size`.
+    fn monitor_for(&self, pos: [f32; 2], size: [f32; 2]) -> Option<Monitor> {
+        let center = [pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0];
+        let monitors = self.cached_monitors();
+        monitors
+            .iter()
+            .find(|m| m.bounds().contains(center))
+            .or_else(|| monitors.iter().find(|m| m.focused))
+            .cloned()
+    }
+
+    /// The "move to monitor" step, if the window isn't on `pos`'s monitor yet.
+    fn monitor_step(
+        &self,
+        address: &str,
+        current: Option<i64>,
+        pos: [f32; 2],
+        size: [f32; 2],
+    ) -> Option<Action> {
+        let target = self.monitor_for(pos, size)?;
+        let current = current.or_else(|| self.window_monitor.borrow().get(address).copied());
+        self.window_monitor
+            .borrow_mut()
+            .insert(address.to_owned(), target.id);
+        (current != Some(target.id)).then_some(Action::ToMonitor(target.name))
     }
 
     /// Makes the next window with this class and title map floating at `size` (and at
@@ -243,9 +347,23 @@ impl Hypr {
         pos: Option<[f32; 2]>,
         size: [f32; 2],
     ) {
-        let pos = pos.map(|p| p.map(|v| v.round() as i32));
+        // Rule positions are relative to the rule's monitor while `pos` is global, so
+        // pick the monitor under the window and convert. Without this the window first
+        // appeared offset (or on the wrong monitor, where Hyprland won't draw it).
+        let monitor = pos.and_then(|p| self.monitor_for(p, size));
+        let placement = pos.zip(monitor.as_ref()).map(|(p, m)| {
+            (
+                m.name.clone(),
+                [p[0].round() as i32 - m.x, p[1].round() as i32 - m.y],
+            )
+        });
         let size = size.map(|v| v.round() as i32);
-        let lua = lua_tile_rule(class, title, pos, size);
+        let lua = lua_tile_rule(
+            class,
+            title,
+            placement.as_ref().map(|(m, p)| (m.as_str(), *p)),
+            size,
+        );
         let legacy = legacy_tile_rule(class, title, size);
         self.run(|dialect| match dialect {
             Dialect::Lua => lua.clone(),
@@ -255,16 +373,21 @@ impl Hypr {
 
     /// Floats, sizes and positions `client`, sending only the steps it still needs.
     pub fn place(&self, client: &Client, pos: [f32; 2], size: [f32; 2]) {
-        let pos = pos.map(|v| v.round() as i32);
-        let size = size.map(|v| v.round() as i32);
         let mut actions = Vec::new();
         if !client.floating {
             actions.push(Action::Float);
         }
+        let to_monitor = self.monitor_step(&client.address, Some(client.monitor), pos, size);
+        let size = size.map(|v| v.round() as i32);
         if client.size != size {
             actions.push(Action::Resize(size));
         }
-        if client.at != pos {
+        let pos = pos.map(|v| v.round() as i32);
+        // Moving to another monitor repositions the window, so the exact move follows.
+        if let Some(step) = to_monitor {
+            actions.push(step);
+            actions.push(Action::Move(pos));
+        } else if client.at != pos {
             actions.push(Action::Move(pos));
         }
         if !actions.is_empty() {
@@ -272,8 +395,57 @@ impl Hypr {
         }
     }
 
-    pub fn move_to(&self, address: &str, pos: [f32; 2]) {
-        self.window_actions(address, &[Action::Move(pos.map(|v| v.round() as i32))]);
+    /// Address of this process's window with the given class (app id).
+    pub fn own_window_address(&self, class: &str) -> Option<String> {
+        let pid = i64::from(std::process::id());
+        self.clients()
+            .into_iter()
+            .find(|c| c.pid == pid && c.class == class)
+            .map(|c| c.address)
+    }
+
+    /// Moves a window onto a hidden workspace without switching the view.
+    pub fn hide_window(&self, address: &str) {
+        self.window_actions(
+            address,
+            &[Action::ToWorkspace {
+                workspace: HIDDEN_WORKSPACE.to_owned(),
+                follow: false,
+            }],
+        );
+    }
+
+    /// Brings a window to the workspace you are looking at and focuses it.
+    pub fn show_window(&self, address: &str) {
+        let Some(active) = self.query::<Workspace>("activeworkspace") else {
+            return;
+        };
+        // Regular workspaces have positive ids; named ones are addressed by name.
+        let workspace = if active.id > 0 {
+            active.id.to_string()
+        } else {
+            format!("name:{}", active.name)
+        };
+        self.window_actions(
+            address,
+            &[
+                Action::ToWorkspace {
+                    workspace,
+                    follow: true,
+                },
+                Action::Focus,
+            ],
+        );
+    }
+
+    /// Moves a window to `pos`, first onto that monitor if it's a different one.
+    pub fn move_to(&self, address: &str, pos: [f32; 2], size: [f32; 2]) {
+        let mut actions: Vec<Action> = self
+            .monitor_step(address, None, pos, size)
+            .into_iter()
+            .collect();
+        actions.push(Action::Move(pos.map(|v| v.round() as i32)));
+        self.window_actions(address, &actions);
     }
 
     fn window_actions(&self, address: &str, actions: &[Action]) {
@@ -302,130 +474,23 @@ impl Hypr {
     }
 }
 
-/// Nudges `win` onto a nearby screen edge or neighbouring window, but only when it is
-/// already within [`SNAP_DISTANCE`]; anything further away is left exactly where it is.
-pub fn snap(win: Rect, monitors: &[Rect], others: &[Rect]) -> [f32; 2] {
-    let center = win.center();
-    let screen = monitors
-        .iter()
-        .find(|m| m.contains(center))
-        .or_else(|| monitors.first());
-
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    if let Some(s) = screen {
-        xs.extend([s.x + SNAP_GAP, s.x + s.w - win.w - SNAP_GAP]);
-        ys.extend([s.y + SNAP_GAP, s.y + s.h - win.h - SNAP_GAP]);
-    }
-    // Only neighbours that are actually close count: a window on another monitor must
-    // not pull this one's top edge into line with it.
-    let reach = SNAP_DISTANCE + SNAP_GAP;
-    for o in others {
-        let h_gap = (o.x - (win.x + win.w)).max(win.x - (o.x + o.w)).max(0.0);
-        let v_gap = (o.y - (win.y + win.h)).max(win.y - (o.y + o.h)).max(0.0);
-        if v_gap <= SNAP_DISTANCE && h_gap <= reach {
-            // Side by side: sit next to it, and line up top or bottom edges.
-            xs.extend([o.x + o.w + SNAP_GAP, o.x - win.w - SNAP_GAP]);
-            ys.extend([o.y, o.y + o.h - win.h]);
-        }
-        if h_gap <= SNAP_DISTANCE && v_gap <= reach {
-            // Stacked: sit above/below it, and line up left or right edges.
-            ys.extend([o.y + o.h + SNAP_GAP, o.y - win.h - SNAP_GAP]);
-            xs.extend([o.x, o.x + o.w - win.w]);
-        }
-    }
-
-    let nearest = |value: f32, candidates: &[f32]| {
-        candidates
-            .iter()
-            .copied()
-            .filter(|c| (c - value).abs() <= SNAP_DISTANCE)
-            .min_by(|a, b| (a - value).abs().total_cmp(&(b - value).abs()))
-            .unwrap_or(value)
-    };
-    [nearest(win.x, &xs), nearest(win.y, &ys)]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SCREEN: Rect = Rect {
-        x: 0.0,
-        y: 35.0,
-        w: 1920.0,
-        h: 1045.0,
-    };
-
-    fn win(x: f32, y: f32) -> Rect {
-        Rect {
-            x,
-            y,
-            w: 400.0,
-            h: 200.0,
-        }
-    }
-
-    #[test]
-    fn far_from_edges_stays_put() {
-        assert_eq!(snap(win(500.0, 400.0), &[SCREEN], &[]), [500.0, 400.0]);
-    }
-
-    #[test]
-    fn near_screen_corner_snaps_with_gap() {
-        assert_eq!(snap(win(15.0, 50.0), &[SCREEN], &[]), [8.0, 43.0]);
-        let right = 1920.0 - 400.0 - SNAP_GAP;
-        assert_eq!(
-            snap(win(right - 10.0, 400.0), &[SCREEN], &[]),
-            [right, 400.0]
-        );
-    }
-
-    #[test]
-    fn snaps_beside_a_neighbour_and_aligns_tops() {
-        let other = Rect {
-            x: 100.0,
-            y: 300.0,
-            w: 400.0,
-            h: 200.0,
-        };
-        let dropped = win(100.0 + 400.0 + 20.0, 310.0);
-        assert_eq!(snap(dropped, &[SCREEN], &[other]), [508.0, 300.0]);
-    }
-
-    #[test]
-    fn snaps_below_a_neighbour_and_aligns_left() {
-        let other = Rect {
-            x: 700.0,
-            y: 100.0,
-            w: 400.0,
-            h: 200.0,
-        };
-        let dropped = win(690.0, 100.0 + 200.0 + 15.0);
-        assert_eq!(snap(dropped, &[SCREEN], &[other]), [700.0, 308.0]);
-    }
-
-    #[test]
-    fn distant_window_does_not_pull_edges_into_line() {
-        // Regression: a pop-out on the other monitor used to drag this one's top edge.
-        let far = Rect {
-            x: 1935.0,
-            y: 110.0,
-            w: 460.0,
-            h: 230.0,
-        };
-        assert_eq!(snap(win(490.0, 120.0), &[SCREEN], &[far]), [490.0, 120.0]);
-    }
-
     #[test]
     fn usable_area_excludes_bars_and_applies_scale() {
         let m = Monitor {
+            id: 1,
+            name: "DP-3".into(),
             x: 1920,
             y: 0,
             width: 2880,
             height: 1800,
             scale: 2.0,
             reserved: [0, 35, 0, 0],
+            focused: false,
+            refresh_rate: 60.0,
         };
         assert_eq!(
             m.usable(),
@@ -463,12 +528,39 @@ mod tests {
         let rule = lua_tile_rule(
             "hyperion-tile",
             "Hyperion — Disk · sd(a)",
-            Some([8, 43]),
+            Some(("DP-1", [8, 43])),
             [460, 190],
         );
         assert_eq!(
             rule,
-            r#"eval hl.window_rule({ name = "hyperion-tile: Hyperion — Disk · sd(a)", match = { class = "^(hyperion-tile)$", title = "^(Hyperion — Disk · sd\\(a\\))$" }, float = true, size = { 460, 190 }, move = { 8, 43 } })"#
+            r#"eval hl.window_rule({ name = "hyperion-tile: Hyperion — Disk · sd(a)", match = { class = "^(hyperion-tile)$", title = "^(Hyperion — Disk · sd\\(a\\))$" }, float = true, no_anim = true, size = { 460, 190 }, monitor = "DP-1", move = { 8, 43 } })"#
+        );
+    }
+
+    #[test]
+    fn builds_hide_and_show_in_both_dialects() {
+        let hide = [Action::ToWorkspace {
+            workspace: HIDDEN_WORKSPACE.to_owned(),
+            follow: false,
+        }];
+        assert_eq!(
+            lua_command("0xab", &hide),
+            r#"eval hl.dispatch(hl.dsp.window.move({ window = "address:0xab", workspace = "special:hyperion", follow = false }))"#
+        );
+        assert_eq!(
+            legacy_command("0xab", &hide),
+            "[[BATCH]]dispatch movetoworkspacesilent special:hyperion,address:0xab"
+        );
+        let show = [
+            Action::ToWorkspace {
+                workspace: "4".to_owned(),
+                follow: true,
+            },
+            Action::Focus,
+        ];
+        assert_eq!(
+            legacy_command("0xab", &show),
+            "[[BATCH]]dispatch movetoworkspace 4,address:0xab;dispatch focuswindow address:0xab"
         );
     }
 

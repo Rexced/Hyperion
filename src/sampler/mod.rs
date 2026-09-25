@@ -1,8 +1,10 @@
 mod cpu;
 mod disk;
+mod gpu;
 mod mem;
 mod net;
 mod procfile;
+pub mod sensors;
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -114,6 +116,8 @@ struct Sampler {
     mem: Option<mem::MemCollector>,
     disk: Option<disk::DiskCollector>,
     net: Option<net::NetCollector>,
+    sensors: sensors::CpuSensors,
+    gpu: gpu::GpuCollector,
 }
 
 impl Sampler {
@@ -125,6 +129,8 @@ impl Sampler {
             mem: mem::MemCollector::new().ok(),
             disk: disk::DiskCollector::new().ok(),
             net: net::NetCollector::new().ok(),
+            sensors: sensors::CpuSensors::new(),
+            gpu: gpu::GpuCollector::new(),
         }
     }
 
@@ -138,10 +144,16 @@ impl Sampler {
         if slow {
             self.last_slow = Some(now);
             if let Some(d) = &mut self.disk {
-                d.refresh_devices();
+                d.refresh(enabled.contains(DiskTemp));
             }
             if let Some(n) = &mut self.net {
                 n.refresh_devices();
+            }
+            if enabled.contains(CpuPower) {
+                self.sensors.retry_power();
+            }
+            if enabled.any(&[GpuUsage, GpuMemory]) {
+                self.gpu.refresh();
             }
         }
 
@@ -149,21 +161,29 @@ impl Sampler {
             t: now.duration_since(self.start).as_secs_f64(),
             ..Default::default()
         };
-        if enabled.any(&[CpuTotal, CpuPerCore]) {
+        if enabled.any(&[CpuTotal, CpuPerCore, CpuTemp, CpuPower]) {
             snap.cpu = self.cpu.as_mut().and_then(|c| c.sample().ok());
+            if let Some(cpu) = &mut snap.cpu {
+                if enabled.contains(CpuTemp) {
+                    cpu.temp_c = self.sensors.temp_c();
+                }
+                if enabled.contains(CpuPower) {
+                    cpu.power_w = self.sensors.power_w();
+                }
+            }
         }
         if enabled.any(&[RamUsage, SwapUsage]) {
             snap.mem = self.mem.as_mut().and_then(|m| m.sample().ok());
         }
-        if enabled.contains(DiskIo) {
-            snap.disks = self
+        if enabled.any(&[DiskIo, DiskIops, DiskTemp, DiskSpace]) {
+            snap.drives = self
                 .disk
                 .as_mut()
-                .and_then(|d| d.sample().ok())
+                .and_then(|d| d.sample(enabled.contains(DiskTemp)).ok())
                 .unwrap_or_default();
         }
-        if enabled.contains(DiskSpace) && slow {
-            snap.filesystems = Some(disk::filesystems());
+        if enabled.any(&[GpuUsage, GpuPower, GpuMemory, GpuTemp]) {
+            snap.gpus = self.gpu.sample();
         }
         if enabled.contains(NetThroughput) {
             snap.net = self

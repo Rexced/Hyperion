@@ -6,7 +6,7 @@ use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::metrics::{EnabledSet, MetricId};
-use crate::ui::theme::ThemeId;
+use crate::ui::theme;
 
 /// 100 ms – 1 s in 100 ms steps, then 1 s – 10 s in 1 s steps.
 pub const INTERVAL_STEPS_MS: [u64; 19] = [
@@ -20,7 +20,7 @@ pub const HISTORY_STEPS_SECS: [u64; 7] = [30, 60, 120, 300, 600, 900, 1800];
 pub struct Config {
     pub interval_ms: u64,
     pub history_secs: u64,
-    /// `ThemeId::key()`; an unrecognized or missing value falls back to the default theme.
+    /// Theme key (a preset, or `custom:<file>`); unknown keys fall back to the default.
     pub theme: String,
     /// Keyed by `MetricId::key()`; missing keys fall back to the metric's default.
     pub metrics: BTreeMap<String, bool>,
@@ -30,6 +30,15 @@ pub struct Config {
     /// Tiles popped out of the grid into their own window. A key here is never also in
     /// `tile_order`.
     pub detached_tiles: BTreeMap<String, DetachedTile>,
+    /// Tile key -> `[columns, rows]` it spans in the grid, set by resizing a tile.
+    /// Tiles not listed are one cell.
+    pub tile_spans: BTreeMap<String, [u8; 2]>,
+    /// Drive id (udev serial) -> whether its tile is shown. Drives not listed show
+    /// only if they hold the root filesystem.
+    pub drives: BTreeMap<String, bool>,
+    /// GPU id (PCI slot) -> whether its tiles are shown. GPUs not listed show if
+    /// they're dedicated cards (or the only GPU).
+    pub gpus: BTreeMap<String, bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -38,6 +47,9 @@ pub struct DetachedTile {
     /// window positions (plain Wayland outside Hyprland), so the compositor picks.
     pub pos: Option<[f32; 2]>,
     pub size: [f32; 2],
+    /// Grid position it was torn off from, so closing the window puts it back there.
+    #[serde(default)]
+    pub home: Option<usize>,
 }
 
 impl Default for Config {
@@ -45,10 +57,13 @@ impl Default for Config {
         Self {
             interval_ms: 1000,
             history_secs: 60,
-            theme: ThemeId::default().key().to_owned(),
+            theme: theme::DEFAULT_KEY.to_owned(),
             metrics: BTreeMap::new(),
             tile_order: Vec::new(),
             detached_tiles: BTreeMap::new(),
+            tile_spans: BTreeMap::new(),
+            drives: BTreeMap::new(),
+            gpus: BTreeMap::new(),
         }
     }
 }
@@ -89,8 +104,10 @@ impl Config {
         Ok(())
     }
 
-    pub fn theme_id(&self) -> ThemeId {
-        ThemeId::from_key(&self.theme).unwrap_or_default()
+    /// Where custom theme files live (`~/.config/hyperion/themes` on Linux,
+    /// `%APPDATA%\hyperion\themes` on Windows).
+    pub fn themes_dir() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("hyperion").join("themes"))
     }
 
     pub fn enabled(&self) -> EnabledSet {
