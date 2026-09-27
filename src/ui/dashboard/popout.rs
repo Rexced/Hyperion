@@ -102,6 +102,12 @@ pub(super) struct WindowState {
     rule_registered: bool,
     address: Option<String>,
     placed: bool,
+    /// The window manager is running an interactive move for this window (everywhere
+    /// but Hyprland); we stay out of its way until it lands.
+    wm_dragging: bool,
+    /// Whether that move has actually been seen with the button held. See the comment
+    /// at its only use.
+    wm_drag_held: bool,
     /// Position and size baked into this window's `ViewportBuilder`, frozen at the
     /// frame it was created. See `creation_geometry`.
     builder_geometry: Option<([f32; 2], [f32; 2])>,
@@ -476,18 +482,29 @@ pub(super) fn show_windows(
         }
 
         if drag_started {
-            let cursor = global_cursor(ctx, board, viewport, local);
-            let at = if board.hypr.is_some() {
+            // Driving the window ourselves needs a pointer position that doesn't come
+            // from the window we're moving. Hyprland's IPC gives us exactly that. Every
+            // other desktop doesn't, and deriving one from this window's own geometry
+            // closes a loop — read where the window is, put the cursor there, move the
+            // window to match, read again — which lags by a frame and so oscillates.
+            // (It also mixed frames of reference: the cursor came from the *inner* rect
+            // while the grab offset and the command were in *outer* coordinates, so any
+            // window border added a fixed shift on every single frame.) On X11 that
+            // showed up as a pop-out shaking while being dragged back. So everywhere but
+            // Hyprland, hand the drag to the window manager, which tracks the pointer
+            // natively and has no such loop.
+            let hypr_at = board.hypr.is_some().then(|| {
                 let address = hypr_address(board, &key, &title);
                 address.zip(board.hypr.as_ref()).and_then(|(address, h)| {
                     let at = h.clients().into_iter().find(|c| c.address == address)?.at;
                     Some([at[0] as f32, at[1] as f32])
                 })
-            } else {
-                outer.map(|r| [r.min.x, r.min.y])
-            };
-            match cursor.zip(at) {
-                Some((cursor, at)) => {
+            });
+            match hypr_at
+                .flatten()
+                .zip(global_cursor(ctx, board, viewport, local))
+            {
+                Some((at, cursor)) => {
                     let main = main_window_rect(ctx, board);
                     board.window_drag = Some(WindowDrag {
                         key: key.clone(),
@@ -498,9 +515,49 @@ pub(super) fn show_windows(
                         dock_slot: None,
                     });
                 }
-                // We can't position windows here: let the compositor move it.
-                None => ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::StartDrag),
+                None => {
+                    ctx.send_viewport_cmd_to(viewport, egui::ViewportCommand::StartDrag);
+                    board.windows.entry(key.clone()).or_default().wm_dragging = true;
+                }
             }
+        }
+
+        // A window the window manager is moving: we only watch where it ends up. Its
+        // position arrives through the `outer` sync above, so there is nothing to drive
+        // here — and nothing to snap afterwards either. We deliberately don't `settle`
+        // this one: every position we send is a chance to fight the window manager, and
+        // avoiding that is the whole point of handing it the drag. The tile stays where
+        // it was dropped unless it landed on the main window, which re-docks it.
+        if board.windows.get(&key).is_some_and(|w| w.wm_dragging) {
+            let state = board.windows.entry(key.clone()).or_default();
+            if primary_down {
+                // The button being held is what tells us the drag is still going. A
+                // window manager that grabs the pointer may never report it, so a
+                // release only counts once we've actually seen it held: otherwise we'd
+                // call the drag finished on its very first frame and re-dock a tile the
+                // user is still moving. If it never reports, the drag just never
+                // auto-finishes and the pop-out's ✕ still sends the tile back.
+                state.wm_drag_held = true;
+                continue;
+            }
+            if !state.wm_drag_held {
+                continue;
+            }
+            state.wm_dragging = false;
+            state.wm_drag_held = false;
+            let main = main_window_rect(ctx, board);
+            if !main_hidden
+                && let Some((landed, main)) = outer.map(to_rect).zip(main)
+                && landed.overlaps(&main)
+            {
+                let origin = main_content_origin(ctx, board, Some(main));
+                redock.push(Redock {
+                    key,
+                    slot: None,
+                    from: origin.map(|o| egui::pos2(landed.x - o[0], landed.y - o[1])),
+                });
+            }
+            continue;
         }
 
         let Some(drag) = board.window_drag.as_ref().filter(|d| d.key == key) else {

@@ -26,7 +26,7 @@ impl Rect {
 }
 
 impl Rect {
-    fn overlaps(&self, o: &Rect) -> bool {
+    pub fn overlaps(&self, o: &Rect) -> bool {
         self.x < o.x + o.w && o.x < self.x + self.w && self.y < o.y + o.h && o.y < self.y + self.h
     }
 
