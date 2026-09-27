@@ -154,7 +154,7 @@ fn theme_picker(ui: &mut egui::Ui, config: &mut Config, themes: &Library) -> Opt
     let mut request = None;
     ui.horizontal(|ui| {
         if ui
-            .button("New from this…")
+            .button("Custom theme")
             .on_hover_text("Make your own theme starting from this one")
             .clicked()
         {

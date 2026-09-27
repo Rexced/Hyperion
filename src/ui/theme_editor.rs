@@ -7,7 +7,10 @@ use crate::hypr::Hypr;
 
 /// App id (Wayland) / class (X11, Hyprland) of the editor's own OS window.
 const APP_ID: &str = "hyperion-theme-editor";
-const DEFAULT_SIZE: [f32; 2] = [380.0, 600.0];
+/// Sized to the collapsed form (name, the six colours, the buttons) rather than to the
+/// form with "Advanced" open, so it doesn't open as a tall window that is mostly empty.
+/// Opening Advanced scrolls; the window is resizable if you'd rather see it all at once.
+const DEFAULT_SIZE: [f32; 2] = [380.0, 330.0];
 const MIN_SIZE: [f32; 2] = [300.0, 260.0];
 
 pub enum Outcome {

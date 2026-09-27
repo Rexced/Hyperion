@@ -102,6 +102,29 @@ pub(super) struct WindowState {
     rule_registered: bool,
     address: Option<String>,
     placed: bool,
+    /// Position and size baked into this window's `ViewportBuilder`, frozen at the
+    /// frame it was created. See `creation_geometry`.
+    builder_geometry: Option<([f32; 2], [f32; 2])>,
+}
+
+/// The position and size to build this window's viewport with — the ones it was first
+/// created at, not wherever it is now.
+///
+/// A `ViewportBuilder` reads like a description of the window, but egui treats it as a
+/// per-frame diff: any field that differs from last frame's builder is turned into a
+/// `ViewportCommand`. So rebuilding it each frame from the live position means every
+/// position change we observe is echoed straight back as an order to move there. On
+/// X11 (unlike Wayland, which ignores `with_position` outright) that closed a loop:
+/// read the window's reported outer rect, ask for exactly that next frame, get a
+/// slightly different rect back from the window manager, ask again — a pop-out left
+/// sitting still would shake continuously and never settle. Freezing these at creation
+/// keeps the builder from ever issuing a move; deliberate moves go through
+/// `move_window` as explicit commands instead.
+fn creation_geometry(state: &mut WindowState, tile: &DetachedTile) -> (Option<[f32; 2]>, [f32; 2]) {
+    let (pos, size) = *state
+        .builder_geometry
+        .get_or_insert((tile.pos.unwrap_or_default(), tile.size));
+    (tile.pos.map(|_| pos), size)
 }
 
 pub(super) fn viewport_id(key: &str) -> egui::ViewportId {
@@ -374,12 +397,13 @@ pub(super) fn show_windows(
             h.register_tile_rule(DETACHED_APP_ID, &title, tile.pos, tile.size);
             state.rule_registered = true;
         }
+        let (creation_pos, creation_size) = creation_geometry(state, &tile);
         let mut builder = egui::ViewportBuilder::default()
             .with_title(title.clone())
             .with_app_id(DETACHED_APP_ID)
-            .with_inner_size(tile.size)
+            .with_inner_size(creation_size)
             .with_decorations(false);
-        if let Some(pos) = tile.pos {
+        if let Some(pos) = creation_pos {
             // Honored on X11 and Windows; Wayland ignores it (Hyprland is placed via IPC).
             builder = builder.with_position(pos);
         }
@@ -714,5 +738,53 @@ pub(super) fn place_windows(
         clients[i].floating = true;
         tile.pos = Some(settled);
         state.placed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tile_at(pos: [f32; 2]) -> DetachedTile {
+        DetachedTile {
+            pos: Some(pos),
+            size: [400.0, 200.0],
+            home: None,
+        }
+    }
+
+    #[test]
+    fn builder_geometry_is_frozen_at_creation_not_followed_live() {
+        // Regression: the viewport builder was rebuilt each frame from the tile's live
+        // position. egui turns any builder field that changed since last frame into a
+        // ViewportCommand, so on X11 — where `with_position` is actually honoured —
+        // reading the window's own reported position back into the tile made us order
+        // it to move there again next frame, and the window manager's slightly
+        // different answer kept the loop going: a pop-out sitting idle shook forever.
+        let mut state = WindowState::default();
+        let (pos, size) = creation_geometry(&mut state, &tile_at([100.0, 200.0]));
+        assert_eq!(pos, Some([100.0, 200.0]));
+        assert_eq!(size, [400.0, 200.0]);
+
+        // The window has since moved (dragged by us, or by the user via the window
+        // manager) and the tile records that. The builder must not follow it.
+        let mut moved = tile_at([137.0, 241.0]);
+        moved.size = [640.0, 480.0];
+        let (pos, size) = creation_geometry(&mut state, &moved);
+        assert_eq!(pos, Some([100.0, 200.0]), "builder position drifted");
+        assert_eq!(size, [400.0, 200.0], "builder size drifted");
+    }
+
+    #[test]
+    fn a_tile_with_no_position_never_gets_one_from_the_builder() {
+        // Plain Wayland: we can't place windows, so the compositor does. Handing the
+        // builder a made-up position would fight it.
+        let mut state = WindowState::default();
+        let unplaced = DetachedTile {
+            pos: None,
+            size: [400.0, 200.0],
+            home: None,
+        };
+        assert_eq!(creation_geometry(&mut state, &unplaced).0, None);
     }
 }

@@ -14,6 +14,40 @@ use crate::ui::theme_editor::{self, ThemeEditor};
 use crate::ui::{dashboard, settings, theme};
 
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
+/// Height of the top bar's single row: the wordmark plus its rule.
+const TOP_BAR_HEIGHT: f32 = 32.0;
+/// Letter spacing of the wordmark. It also pads the right of the final glyph, so it
+/// comes back off centring maths below.
+const WORDMARK_SPACING: f32 = 6.0;
+
+/// The centred wordmark: a letter-spaced name over a short accent rule. Deliberately
+/// plain — the dashboard under it is the busy part.
+fn wordmark(ui: &mut egui::Ui, row: egui::Rect, palette: &theme::Palette) {
+    let mut title_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(row)
+            .layout(egui::Layout::top_down(egui::Align::Center)),
+    );
+    let title = title_ui.label(
+        egui::RichText::new("HYPERION")
+            .size(17.0)
+            .strong()
+            .extra_letter_spacing(WORDMARK_SPACING)
+            .color(palette.text),
+    );
+    // The trailing spacing after the last glyph sits inside the label's rect, so the
+    // text one sees is half of it left of that rect's centre.
+    let center_x = title.rect.center().x - WORDMARK_SPACING / 2.0;
+    let half_rule = title.rect.width() * 0.18;
+    let y = title.rect.bottom() + 5.0;
+    title_ui.painter().line_segment(
+        [
+            egui::pos2(center_x - half_rule, y),
+            egui::pos2(center_x + half_rule, y),
+        ],
+        egui::Stroke::new(1.5, palette.accent),
+    );
+}
 
 pub struct HyperionApp {
     config: Config,
@@ -216,27 +250,20 @@ impl eframe::App for HyperionApp {
         egui::Panel::top("top_bar")
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(16, 10)))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (dot, _) =
-                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                    ui.painter()
-                        .circle_filled(dot.center(), 5.0, palette.accent);
-                    ui.label(
-                        egui::RichText::new("HYPERION")
-                            .size(20.0)
-                            .strong()
-                            .extra_letter_spacing(3.0)
-                            .color(palette.text),
-                    );
-                    ui.label(
-                        egui::RichText::new("system monitor")
-                            .size(13.0)
-                            .color(palette.text_dim),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.toggle_value(&mut self.show_settings, "⚙ Settings");
-                    });
-                });
+                // The wordmark and the button are drawn over the same row rather than
+                // in sequence, so the title is centred on the window itself and doesn't
+                // shift when the button beside it changes width.
+                let (row, _) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), TOP_BAR_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                wordmark(ui, row, &palette);
+                let mut right = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(row)
+                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                );
+                right.toggle_value(&mut self.show_settings, "⚙ Settings");
             });
 
         self.update_power_access();
