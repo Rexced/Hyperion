@@ -172,11 +172,17 @@ fn hypr_address(board: &mut TileBoard, key: &str, title: &str) -> Option<String>
     let h = board.hypr.as_ref()?;
     let state = board.windows.entry(key.to_owned()).or_default();
     if state.address.is_none() {
-        state.address = h
+        let found = h
             .clients()
             .into_iter()
-            .find(|c| c.pid == own_pid() && c.title == title)
-            .map(|c| c.address);
+            .find(|c| c.pid == own_pid() && c.title == title);
+        // Seed the monitor cache from where Hyprland already has it, so the first
+        // `move_to` (in `carry_torn`) doesn't mistake "not cached yet" for "on the
+        // wrong monitor" and send a redundant, position-resetting monitor move.
+        if let Some(c) = &found {
+            h.note_monitor(&c.address, c.monitor);
+        }
+        state.address = found.map(|c| c.address);
     }
     state.address.clone()
 }
@@ -378,7 +384,12 @@ pub(super) fn show_windows(
             builder = builder.with_position(pos);
         }
         let viewport = viewport_id(&key);
-        let id = tile_id(&key);
+        // Distinct from the grid's `tile_id(key)`: since tearing off can now happen the
+        // same frame a tile is picked up (one already flush against the window edge
+        // needs only a tiny drag to stick out), that id and this one's drag-handle
+        // interact could otherwise both get registered — in different layers, in
+        // different viewports — within a single frame, which egui flags as a bug.
+        let id = tile_id(&key).with("popout");
 
         let (drag_started, close, outer, primary_down, local, buttons) = ctx
             .show_viewport_immediate(viewport, builder, |ui, _class| {
@@ -421,8 +432,20 @@ pub(super) fn show_windows(
         if torn == Some(key.as_str()) {
             continue;
         }
+        // Whether we are about to set this window's position ourselves from the
+        // cursor this very frame (the block below, or the continuing drag further
+        // down). If so, the `outer` rect the platform just reported can be a frame
+        // stale — on X11 a move is asynchronous — so syncing `pos` from it here,
+        // right before overwriting it again with the fresher cursor-derived value,
+        // fed a stale position back in as the *next* frame's read, which raced with
+        // our own command and showed up as the window vibrating while dragged. This
+        // sync is for when the compositor (or the user, via its own controls) moved
+        // the window and we need to notice, not for while we're the one moving it.
+        let driving_this = board.window_drag.as_ref().is_some_and(|d| d.key == key)
+            && global_cursor(ctx, board, viewport, local).is_some();
         if let Some(r) = outer
             && board.hypr.is_none()
+            && !driving_this
             && let Some(t) = detached.get_mut(&key)
         {
             t.pos = Some([r.min.x, r.min.y]);

@@ -3,6 +3,12 @@
 use eframe::egui::{self, Color32, RichText};
 
 use super::theme::{self, Library, ThemeColor, ThemeSpec};
+use crate::hypr::Hypr;
+
+/// App id (Wayland) / class (X11, Hyprland) of the editor's own OS window.
+const APP_ID: &str = "hyperion-theme-editor";
+const DEFAULT_SIZE: [f32; 2] = [380.0, 600.0];
+const MIN_SIZE: [f32; 2] = [300.0, 260.0];
 
 pub enum Outcome {
     /// Still open; the app previews `draft()`.
@@ -18,6 +24,11 @@ pub struct ThemeEditor {
     /// Key of the custom theme being edited in place; `None` makes a new theme.
     editing: Option<String>,
     error: Option<String>,
+    /// `None` off Hyprland. Its own instance, not shared with the dashboard's: the
+    /// IPC connection is just a socket path, cheap to open again.
+    hypr: Option<Hypr>,
+    /// Whether the float/no-anim window rule has been sent yet (Hyprland only).
+    rule_registered: bool,
 }
 
 impl ThemeEditor {
@@ -29,6 +40,8 @@ impl ThemeEditor {
             draft,
             editing: None,
             error: None,
+            hypr: Hypr::detect(),
+            rule_registered: false,
         }
     }
 
@@ -38,6 +51,8 @@ impl ThemeEditor {
             draft: entry.spec.clone(),
             editing: entry.is_custom().then(|| entry.key.clone()),
             error: None,
+            hypr: Hypr::detect(),
+            rule_registered: false,
         }
     }
 
@@ -45,24 +60,40 @@ impl ThemeEditor {
         &self.draft
     }
 
+    /// Shown as its own OS window (not an in-window `egui::Window`) so it gets a
+    /// native title bar and resize border: movable and resizable anywhere on screen,
+    /// and no longer confined to — and so clippable by — the main window's own
+    /// canvas, which is what let the colour-picker's gradient square get cut off at
+    /// the bottom when the main window sat low on the screen.
     pub fn show(&mut self, ctx: &egui::Context, library: &mut Library) -> Outcome {
-        let mut outcome = Outcome::Editing;
-        let mut open = true;
         let title = if self.editing.is_some() {
             "Edit theme"
         } else {
             "New theme"
         };
-        egui::Window::new(title)
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(340.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                outcome = self.contents(ui, library);
+        if let Some(h) = &self.hypr
+            && !self.rule_registered
+        {
+            h.register_tile_rule(APP_ID, title, None, DEFAULT_SIZE);
+            self.rule_registered = true;
+        }
+        let viewport = egui::ViewportId::from_hash_of("hyperion-theme-editor");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_app_id(APP_ID)
+            .with_inner_size(DEFAULT_SIZE)
+            .with_min_inner_size(MIN_SIZE)
+            .with_resizable(true);
+        let (outcome, close_requested) =
+            ctx.show_viewport_immediate(viewport, builder, |ui, _class| {
+                let mut outcome = Outcome::Editing;
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    outcome = self.contents(ui, library);
+                });
+                let close_requested = ui.input(|i| i.viewport().close_requested());
+                (outcome, close_requested)
             });
-        if !open {
+        if close_requested {
             return Outcome::Cancelled;
         }
         outcome

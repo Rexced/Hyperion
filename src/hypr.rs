@@ -321,6 +321,19 @@ impl Hypr {
             .cloned()
     }
 
+    /// Records which monitor a window is already known to be on (from Hyprland's own
+    /// client list), so the next `move_to` doesn't have to guess. Without this, the
+    /// first live-drag move after a window is freshly discovered found nothing cached,
+    /// treated that as "unknown, so different", and sent a redundant "move to monitor"
+    /// step even though the window was already there — which visibly snapped it,
+    /// since Hyprland re-centers a window on a "move to monitor" that doesn't also
+    /// carry coordinates.
+    pub fn note_monitor(&self, address: &str, monitor: i64) {
+        self.window_monitor
+            .borrow_mut()
+            .insert(address.to_owned(), monitor);
+    }
+
     /// The "move to monitor" step, if the window isn't on `pos`'s monitor yet.
     fn monitor_step(
         &self,

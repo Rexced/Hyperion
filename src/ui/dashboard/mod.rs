@@ -20,9 +20,6 @@ use tiles::Card;
 
 /// How long tiles take to slide into a new slot.
 const SLIDE_SECS: f32 = 0.18;
-/// A torn-off tile only re-docks once the cursor is this far back inside the window,
-/// so hovering right on the edge doesn't flip it in and out.
-const REENTRY_MARGIN: f32 = 24.0;
 /// Size of the resize grip in a tile's bottom-right corner.
 const GRIP: f32 = 16.0;
 
@@ -429,7 +426,25 @@ pub fn show(
     if let Some((key, grab, size, slot, origin_slot, mut torn)) = held {
         let c = by_key.get(&key).copied();
         let cancelled = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-        let outside_window = pointer.is_none_or(|p| !window.contains(p));
+        // Whether the tile itself — not just the cursor — would stick out past the
+        // main window if dropped now. Tearing off exactly when this becomes true,
+        // rather than waiting for the cursor to leave, matters for two things: the
+        // tile's edge is genuinely visible leaving the window (it can only ever be
+        // drawn past the window's edge once it's a real, separate window), and
+        // there's no jump, because we switch to that real window while its last
+        // drawn position is still accurate, not after the cursor has already
+        // travelled on well past the edge while the (clipped) tile sat frozen there.
+        //
+        // Re-docking (`back_inside`, below) is its exact negation, on purpose: pairing
+        // this with the old cursor-point re-entry check made the two thresholds
+        // overlap (the tile could already be poking out while the cursor sat well
+        // inside that check's margin), so every other frame flipped torn back off and
+        // on — tearing off again re-registers the pop-out's placement rule from
+        // scratch each time, at whatever the cursor had reached by then, which is what
+        // actually produced the "shoots off" jump: not a single bad handoff, but
+        // several of these restarts stacking up over a handful of frames.
+        let tile_rect = |p: egui::Pos2| egui::Rect::from_min_size(p - grab, size);
+        let outside_window = pointer.is_none_or(|p| !window.contains_rect(tile_rect(p)));
         let restore = |order: &mut Vec<String>| drop_at(order, &key, origin_slot);
 
         if cancelled {
@@ -443,7 +458,7 @@ pub fn show(
         } else if ctx.input(|i| i.pointer.primary_down()) {
             ctx.request_repaint();
             ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-            let back_inside = pointer.is_some_and(|p| window.shrink(REENTRY_MARGIN).contains(p));
+            let back_inside = !outside_window;
             if !torn && outside_window {
                 torn = true;
                 order.retain(|k| k != &key);
@@ -566,9 +581,10 @@ fn show_lifted(
     egui::Area::new(tile_id(key).with("lifted"))
         .order(egui::Order::Tooltip)
         .interactable(false)
-        // Areas are kept inside the window by default, which pinned the tile to the edge
-        // while the cursor moved on, and made it jump once it popped out. Let it follow
-        // the cursor past the edge (clipped), so the pop-out appears right where it is.
+        // Areas are kept inside the window by default. In practice tearing off now
+        // happens before any part of the tile would reach the edge (see
+        // `outside_window` above), so this never has to draw past it; `constrain(false)`
+        // is just a safety net against a one-frame lag in that check.
         .constrain(false)
         .fixed_pos(pos)
         .show(ctx, |ui| {
@@ -879,19 +895,58 @@ mod tests {
     }
 
     #[test]
-    fn e2e_dragged_tile_follows_the_cursor_past_the_window_edge() {
-        // Regression: the lifted tile was kept inside the window, so it stopped at
-        // the edge while the cursor went on, then jumped when it popped out.
+    fn e2e_tears_off_as_soon_as_the_tile_would_stick_out_not_the_cursor() {
+        // Regression: tearing off waited for the CURSOR to leave the window, so
+        // nothing of the tile was ever visible past the edge (it was clipped, sitting
+        // frozen there, since a still-docked tile can only be drawn inside the main
+        // window), and by the time it finally popped out the cursor had already
+        // travelled well beyond, making it jump. Now it tears off the instant its own
+        // rect would first stick out, while the cursor is still comfortably inside.
         let mut h = Harness::new(SCREEN);
         h.frame(vec![egui::Event::PointerMoved(CELL_0)]);
         h.button(CELL_0, true);
-        h.glide(CELL_0, egui::pos2(5.0, 200.0));
-        let lifted = h
-            .ctx
-            .memory(|m| m.area_rect(tile_id("cpu").with("lifted")))
-            .unwrap();
-        // Grabbed 100px from its left edge, so its left edge is 95px past the window's.
-        assert_eq!(lifted.min.x, 5.0 - 100.0);
+        // The cpu tile sits flush against the window's left edge (min.x = 0) and was
+        // grabbed 100px in, so moving the cursor left by even 20px already pushes the
+        // tile's own left edge 20px past x = 0.
+        let p = CELL_0 - egui::vec2(20.0, 0.0);
+        h.frame(vec![egui::Event::PointerMoved(p)]);
+        assert!(
+            p.x > 0.0,
+            "the cursor itself is still well inside the window"
+        );
+        // Tore off already: the tile's own edge, not the cursor, decides. (The
+        // headless test board has no real window backend, so `pos` isn't set here;
+        // that part is exercised live, not by this harness.)
+        assert!(h.detached.contains_key("cpu"));
+        assert!(h.board.grid_drag.as_ref().is_some_and(|d| d.torn));
+    }
+
+    #[test]
+    fn e2e_staying_torn_does_not_flicker_back_and_forth() {
+        // Regression: tearing off now triggers on the tile's rect (above), but
+        // re-docking still triggered on the CURSOR alone being back inside a margin —
+        // which it always was, right from the frame it tore off (only the tile's edge
+        // had crossed, not the cursor). So the very next frame undid the tear-off, and
+        // the frame after that redid it, registering the pop-out's placement rule
+        // fresh each time at whatever the cursor had reached by then. Several of
+        // those restarts in a row is what actually produced the "shoots off" jump.
+        let mut h = Harness::new(SCREEN);
+        h.frame(vec![egui::Event::PointerMoved(CELL_0)]);
+        h.button(CELL_0, true);
+        // A big enough first move for egui to recognise the drag and tear off.
+        let mut p = CELL_0 - egui::vec2(20.0, 0.0);
+        h.frame(vec![egui::Event::PointerMoved(p)]);
+        assert!(h.detached.contains_key("cpu"), "didn't tear off");
+        // Small further moves, still well inside the window: must stay torn.
+        for _ in 0..10 {
+            p -= egui::vec2(5.0, 0.0);
+            h.frame(vec![egui::Event::PointerMoved(p)]);
+            assert!(
+                h.detached.contains_key("cpu"),
+                "flickered back to docked at cursor {p:?}, still {} px inside the window",
+                p.x
+            );
+        }
     }
 
     #[test]
