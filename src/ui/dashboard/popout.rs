@@ -241,11 +241,12 @@ fn move_window(
 
 /// Screen areas (minus bars) and our other windows, for snapping a released window.
 fn surroundings(
+    ctx: &egui::Context,
     board: &TileBoard,
     detached: &BTreeMap<String, DetachedTile>,
     except: &str,
     main: Option<Rect>,
-) -> (Vec<Rect>, Vec<Rect>) {
+) -> Around {
     if let Some(h) = &board.hypr {
         let skip = board.windows.get(except).and_then(|w| w.address.as_deref());
         let screens = h.monitors().iter().map(hypr::Monitor::usable).collect();
@@ -259,9 +260,32 @@ fn surroundings(
             })
             .map(hypr::Client::rect)
             .collect();
-        return (screens, others);
+        // Hyprland's `usable` already subtracts whatever the bars reserve.
+        return Around {
+            screens,
+            screens_exclude_panels: true,
+            others,
+        };
     }
-    // Elsewhere we only know our own windows, and not the screen edges.
+    // Elsewhere all we get is the size of the monitor, with no say on where that
+    // monitor starts, so we assume it starts at the origin the way egui's own
+    // "centre on screen" helper does. On a single display that is exactly right. On a
+    // multi-monitor desktop it is wrong for every monitor but the first — but wrong in
+    // the safe direction: positions on the others simply fail the "is it on a screen"
+    // test, so a released window stays where it was put instead of being sent
+    // somewhere unreachable.
+    let screens = ctx
+        .input_for(egui::ViewportId::ROOT, |i| i.viewport().monitor_size)
+        .filter(|size| size.x > 1.0 && size.y > 1.0)
+        .map(|size| {
+            vec![Rect {
+                x: 0.0,
+                y: 0.0,
+                w: size.x,
+                h: size.y,
+            }]
+        })
+        .unwrap_or_default();
     let others = detached
         .iter()
         .filter(|(k, _)| k.as_str() != except)
@@ -275,7 +299,33 @@ fn surroundings(
         })
         .chain(main)
         .collect();
-    (Vec::new(), others)
+    Around {
+        screens,
+        // Only the size of the display: X11 reports the panel-excluded work area
+        // separately, and we have no way to read it from here. Enough to keep a window
+        // on screen, not enough to snap one against an edge.
+        screens_exclude_panels: false,
+        others,
+    }
+}
+
+/// What is around a window: where it may go, and what it must not sit on top of.
+struct Around {
+    screens: Vec<Rect>,
+    /// Whether `screens` has panel/bar space already taken out. See
+    /// [`placement::Screens`].
+    screens_exclude_panels: bool,
+    others: Vec<Rect>,
+}
+
+impl Around {
+    fn screens(&self) -> placement::Screens<'_> {
+        if self.screens_exclude_panels {
+            placement::Screens::usable(&self.screens)
+        } else {
+            placement::Screens::whole_display(&self.screens)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------
@@ -353,8 +403,8 @@ pub(super) fn settle(
         w: tile.size[0],
         h: tile.size[1],
     };
-    let (screens, others) = surroundings(board, detached, &key, main);
-    let pos = placement::settle(win, &screens, &others);
+    let around = surroundings(ctx, board, detached, &key, main);
+    let pos = placement::settle(win, around.screens(), &around.others);
     if let Some(tile) = detached.get_mut(&key) {
         tile.pos = Some(pos);
     }
@@ -787,7 +837,7 @@ pub(super) fn place_windows(
             })
             .map(hypr::Client::rect)
             .collect();
-        let settled = placement::settle(win, screens, &others);
+        let settled = placement::settle(win, placement::Screens::usable(screens), &others);
         h.place(&clients[i], settled, tile.size);
         // Later windows in this same pass must see where this one went now.
         clients[i].at = settled.map(|v| v.round() as i32);
